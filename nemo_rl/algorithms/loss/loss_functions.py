@@ -256,7 +256,10 @@ class ClippedPGLossFn(LossFunction):
         token_mask = data["token_mask"][:, 1:]
         sample_mask = data["sample_mask"]
         advantages = data["advantages"][:, 1:]
-        prev_logprobs = data["prev_logprobs"][:, 1:]
+        # Skip loading prev_logprobs when force_on_policy_ratio=True (will use curr_logprobs instead)
+        prev_logprobs = (
+            None if self.force_on_policy_ratio else data["prev_logprobs"][:, 1:]
+        )
         generation_logprobs = data["generation_logprobs"][:, 1:]
         if self.reference_policy_kl_penalty != 0:
             reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
@@ -952,6 +955,179 @@ class DistillationLossDataDict(TypedDict):
     teacher_topk_indices: torch.Tensor
 
 
+def _compute_distillation_topk_logprobs(
+    next_token_logits: torch.Tensor,
+    teacher_topk_logits: torch.Tensor,
+    teacher_topk_indices: torch.Tensor,
+    zero_outside_topk: bool,
+    compute_entropy: bool,
+    vocab_parallel_rank: Optional[int] = None,
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Derive student/teacher top-k logprobs (and optional full-vocab student entropy) from raw logits.
+
+    Shared by ``DistillationLossFn`` and ``SDPOLossFn`` so the subtle
+    vocab-parallel / context-parallel / DTensor gather + next-token alignment
+    logic lives in exactly one place.
+
+    Args:
+        next_token_logits: raw student logits [B, S, V_local].
+        teacher_topk_logits: teacher top-k logits aligned to student positions [B, S, k].
+        teacher_topk_indices: teacher top-k vocab indices [B, S, k].
+        zero_outside_topk: model the teacher as having ~0 mass outside top-k.
+        compute_entropy: when True (and ``zero_outside_topk``), also return the
+            full-vocab student entropy ``H_all`` used for the tail correction.
+        vocab_parallel_rank/group, context_parallel_group: parallelism handles.
+
+    Returns:
+        ``(student_topk_logprobs, teacher_topk_logprobs, H_all)`` all next-token
+        aligned (sliced ``[:, :-1]``). ``H_all`` is ``None`` when not computed.
+    """
+    # CP support: get CP group and size
+    cp_group = context_parallel_group
+    cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
+
+    # Ensure float32 for stability (match other losses)
+    next_token_logits = next_token_logits.to(torch.float32)
+    H_all = None
+
+    if teacher_topk_indices.shape[-1] <= 0:
+        raise ValueError(
+            f"topk must be positive, got {teacher_topk_indices.shape[-1]}. "
+            "topk=0 is not supported as it would result in empty tensor operations."
+        )
+
+    # Determine processing path and setup variables
+    if vocab_parallel_group is not None:
+        assert vocab_parallel_rank is not None, (
+            "vocab_parallel_rank must be provided when vocab_parallel_group is provided"
+        )
+        V_local = int(next_token_logits.shape[-1])
+        vocab_start_index = vocab_parallel_rank * V_local
+        vocab_end_index = (vocab_parallel_rank + 1) * V_local
+        parallel_group = vocab_parallel_group
+        logits_tensor = next_token_logits
+    elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
+        device_mesh = next_token_logits.device_mesh
+        tp_group = device_mesh.get_group("tp")
+        tp_rank = tp_group.rank()
+        local_student_logits = next_token_logits.to_local()
+        V_local = int(local_student_logits.shape[-1])
+        vocab_start_index = tp_rank * V_local
+        vocab_end_index = (tp_rank + 1) * V_local
+        parallel_group = tp_group
+        logits_tensor = local_student_logits
+        teacher_topk_indices = teacher_topk_indices.to(local_student_logits.device)
+        # For DTensor, derive CP group/size from the device mesh to ensure CP-aware alignment
+        if (
+            device_mesh.mesh_dim_names is not None
+            and "cp" in device_mesh.mesh_dim_names
+        ):
+            cp_group = device_mesh.get_group("cp")
+            cp_size = cp_group.size()
+        else:
+            cp_group = None
+            cp_size = 1
+    else:
+        parallel_group = None
+        logits_tensor = next_token_logits
+
+    # Process based on zero_outside_topk setting
+    if zero_outside_topk and parallel_group is not None:
+        # Distributed processing with chunking
+        indices_local = teacher_topk_indices
+        pad_len = 0
+        if cp_size > 1:
+            pad_len = logits_tensor.shape[1] * cp_size - indices_local.shape[1]
+            if pad_len > 0:
+                indices_local = torch.nn.functional.pad(
+                    indices_local, (0, 0, 0, pad_len), value=0
+                )
+            cp_rank = torch.distributed.get_rank(cp_group)
+            indices_local = _get_tokens_on_this_cp_rank(
+                indices_local, cp_rank, cp_size, seq_dim=1
+            )
+
+        S_local = int(logits_tensor.shape[1])
+        chunk_size = max(1, min(S_local, 1024))
+        student_topk_logprobs = ChunkedDistributedGatherLogprob.apply(  # type: ignore
+            logits_tensor,
+            indices_local,
+            vocab_start_index,
+            vocab_end_index,
+            chunk_size,
+            parallel_group,
+            False,
+        )
+
+        if compute_entropy:
+            H_all = ChunkedDistributedEntropy.apply(  # type: ignore
+                logits_tensor,
+                chunk_size,
+                parallel_group,
+                False,
+            )
+
+        if cp_size > 1:
+            student_topk_logprobs = allgather_cp_sharded_tensor(
+                student_topk_logprobs, cp_group, seq_dim=1
+            )
+            if compute_entropy:
+                H_all = allgather_cp_sharded_tensor(H_all, cp_group, seq_dim=1)
+            if pad_len > 0:
+                student_topk_logprobs = student_topk_logprobs[:, :-pad_len, :]
+                if compute_entropy:
+                    H_all = H_all[:, :-pad_len]
+    elif zero_outside_topk:
+        # Non-distributed processing
+        student_logprobs = torch.nn.functional.log_softmax(logits_tensor, dim=-1)
+        student_topk_logprobs = student_logprobs.gather(
+            dim=-1, index=teacher_topk_indices.to(student_logprobs.device)
+        )
+        if compute_entropy:
+            H_all = (student_logprobs.exp() * student_logprobs).sum(-1)
+    else:
+        # Gather logits at global indices
+        if (parallel_group is not None) or (cp_size > 1):
+            student_topk_logits = gather_logits_at_global_indices(
+                logits_tensor,
+                teacher_topk_indices,
+                tp_group=parallel_group,
+                cp_group=cp_group,
+                vocab_start_index=(
+                    vocab_start_index if parallel_group is not None else 0
+                ),
+                vocab_end_index=(
+                    vocab_end_index
+                    if parallel_group is not None
+                    else int(logits_tensor.shape[-1])
+                ),
+            )
+        else:
+            student_topk_logits = logits_tensor.gather(
+                dim=-1, index=teacher_topk_indices.to(logits_tensor.device)
+            )
+        student_topk_logprobs = torch.nn.functional.log_softmax(
+            student_topk_logits, dim=-1
+        )
+
+    # Move teacher tensors to the same device/dtype as student_topk_logits
+    teacher_topk_logits = teacher_topk_logits.to(
+        student_topk_logprobs.device, dtype=student_topk_logprobs.dtype
+    )
+    teacher_topk_logprobs = torch.nn.functional.log_softmax(teacher_topk_logits, dim=-1)
+
+    # Single point of next-token alignment after TP/CP processing
+    teacher_topk_logprobs = teacher_topk_logprobs[:, :-1, :]
+    student_topk_logprobs = student_topk_logprobs[:, :-1, :]
+    if zero_outside_topk and compute_entropy:
+        # Align H_all with next-token prediction
+        H_all = H_all[:, :-1]
+
+    return student_topk_logprobs, teacher_topk_logprobs, H_all
+
+
 class DistillationLossFn(LossFunction):
     """Distillation loss function."""
 
@@ -1035,3 +1211,350 @@ class DistillationLossFn(LossFunction):
         }
 
         return kl_loss, metrics
+
+
+class SDPOLossConfig(TypedDict):
+    """Configuration for the SDPO (Self-Distilled Policy Optimization) loss.
+
+    SDPO computes a logit-level KL between a student (current policy on the
+    original prompt) and a self-teacher (same policy conditioned on a successful
+    demonstration), summed over the full vocabulary at every response position
+    (top-k approximation).
+
+    Defaults:
+        kl_type: "reverse"            - "forward", "mixed", or "js" (symmetric
+                                        Jensen-Shannon, bounded in [0, log 2] per token) also supported
+        mixed_kl_weight: 0.5          - weight on forward-KL when kl_type="mixed"
+        zero_outside_topk: True       - model the teacher as having ~0 mass outside top-k
+                                        and add the corresponding tail-correction term to the loss.
+                                        Setting False omits the tail and keeps only the top-k sum
+                                        (cheaper, less accurate).
+        success_reward_threshold: 1.0 - minimum reward to count as "successful" (used by orchestration)
+    """
+
+    kl_type: NotRequired[str]
+    mixed_kl_weight: NotRequired[float]
+    zero_outside_topk: NotRequired[bool]
+    success_reward_threshold: float
+    # When penalty > 0, the loss adds beta * KL(student || ref) summed over
+    # response positions, where the KL is estimated by one of Schulman's
+    # k1/k2/k3 estimators at the sampled tokens.
+    reference_policy_kl_penalty: NotRequired[float]
+    reference_policy_kl_type: NotRequired[str]
+
+
+class SDPOLossDataDict(TypedDict):
+    """Required keys in the data BatchedDataDict for SDPOLossFn."""
+
+    input_ids: torch.Tensor  # [B, S]
+    token_mask: torch.Tensor  # [B, S]      1 = response token
+    sample_mask: torch.Tensor  # [B]         1 = valid sample
+    sdpo_mask: torch.Tensor  # [B]         1 = sample has a demonstration
+    teacher_topk_logits: torch.Tensor  # [B, S, K]   aligned to student positions
+    teacher_topk_indices: torch.Tensor  # [B, S, K]
+
+
+class SDPOLossFn(LossFunction):
+    """Self-Distilled Policy Optimization loss (logit-level KL).
+
+    Trains the student (current policy on the original prompt) to match the
+    self-teacher (current policy conditioned on a successful demonstration) via
+    a top-k logit-level KL summed over response positions:
+
+        L(θ) = Σ_t  D_KL( π_θ(·|x, y_<t)  ‖  stopgrad π_θ(·|x, f, y_<t) )
+             ≈ Σ_t  Σ_{ŷ ∈ topK}  π_θ(ŷ|x,y_<t) · [log π_θ(ŷ|x,y_<t) − log π_T(ŷ|x,f,y_<t)]
+               + tail_correction_t       (when zero_outside_topk=True)
+
+    Top-k indices are chosen by the teacher. Tail correction uses the
+    full-vocab student entropy H_all returned by the training forward, so the gather
+    over top-k preserves an unbiased estimate of the full-vocabulary KL even with
+    K << |V|.
+
+    Samples without a demonstration (sdpo_mask=0) contribute zero to the loss.
+
+    This loss receives the raw student logits and derives the student/teacher
+    top-k logprobs (and H_all) internally via
+    :func:`_compute_distillation_topk_logprobs`, matching super-v3's
+    loss-agnostic worker calling convention (same as DistillationLossFn).
+
+    References:
+        Hübotter et al. (2026) "Reinforcement Learning via Self-Distillation"
+        arXiv:2601.20802
+    """
+
+    loss_type = LossType.TOKEN_LEVEL
+
+    def __init__(self, cfg: SDPOLossConfig):
+        self.kl_type: str = cfg.get("kl_type", "reverse")
+        self.mixed_kl_weight: float = cfg.get("mixed_kl_weight", 0.5)
+        self.zero_outside_topk: bool = cfg.get("zero_outside_topk", True)
+        self.log_infinitesimal: float = -100.0
+        self.reference_policy_kl_penalty: float = cfg.get(
+            "reference_policy_kl_penalty", 0.0
+        )
+        self.reference_policy_kl_type: str = cfg.get("reference_policy_kl_type", "k3")
+
+        if self.kl_type not in {"forward", "reverse", "mixed", "js"}:
+            raise ValueError(
+                f"SDPOLossFn: kl_type must be one of forward/reverse/mixed/js, got {self.kl_type}"
+            )
+        if not 0.0 <= self.mixed_kl_weight <= 1.0:
+            raise ValueError(
+                f"SDPOLossFn: mixed_kl_weight must be in [0, 1], got {self.mixed_kl_weight}"
+            )
+        if self.reference_policy_kl_penalty < 0.0:
+            raise ValueError(
+                f"SDPOLossFn: reference_policy_kl_penalty must be >= 0, got {self.reference_policy_kl_penalty}"
+            )
+        if self.reference_policy_kl_type not in {"k1", "k2", "k3"}:
+            raise ValueError(
+                f"SDPOLossFn: reference_policy_kl_type must be one of k1/k2/k3, got {self.reference_policy_kl_type}"
+            )
+
+    def __call__(
+        self,
+        next_token_logits: torch.Tensor,
+        data: BatchedDataDict[SDPOLossDataDict],
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Compute the SDPO logit-level KL loss from raw student logits."""
+        # Derive next-token-aligned top-k logprobs (and H_all for the tail
+        # correction) from the raw logits, sharing DistillationLossFn's
+        # vocab-parallel / CP / DTensor gather logic.
+        student_topk_logprobs, teacher_topk_logprobs, H_all = (
+            _compute_distillation_topk_logprobs(
+                next_token_logits,
+                data["teacher_topk_logits"],
+                data["teacher_topk_indices"],
+                zero_outside_topk=self.zero_outside_topk,
+                compute_entropy=self.kl_type not in {"forward", "js"},
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+            )
+        )
+
+        student_probs = student_topk_logprobs.exp()  # [B, S-1, K]
+        teacher_probs = teacher_topk_logprobs.exp()  # [B, S-1, K]
+
+        if self.kl_type == "forward":
+            per_token_kl = teacher_probs * (
+                teacher_topk_logprobs - student_topk_logprobs
+            )
+        elif self.kl_type == "reverse":
+            per_token_kl = student_probs * (
+                student_topk_logprobs - teacher_topk_logprobs
+            )
+        elif self.kl_type == "js":
+            # Symmetric Jensen-Shannon divergence at top-k positions, bounded in
+            # [0, log 2] per (sample, position).
+            m_probs = 0.5 * (student_probs + teacher_probs)
+            log_m = m_probs.clamp_min(1e-12).log()
+            per_token_kl = 0.5 * student_probs * (
+                student_topk_logprobs - log_m
+            ) + 0.5 * teacher_probs * (teacher_topk_logprobs - log_m)
+        else:
+            kl_forward = teacher_probs * (teacher_topk_logprobs - student_topk_logprobs)
+            kl_reverse = student_probs * (student_topk_logprobs - teacher_topk_logprobs)
+            per_token_kl = (
+                self.mixed_kl_weight * kl_forward
+                + (1.0 - self.mixed_kl_weight) * kl_reverse
+            )
+
+        per_token_kl = per_token_kl.sum(dim=-1)  # [B, S-1]
+
+        # Tail correction for tokens outside top-k (mirrors DistillationLossFn).
+        # Added when we treat the teacher as having ~0 mass outside its top-k
+        # (zero_outside_topk=True): the student-weighted tail entropy is added
+        # back so the approximation stays unbiased. Skipped for "forward"
+        # (teacher's near-zero tail mass already implies ~zero contribution) and
+        # "js" (the JS midpoint distribution doesn't factor into a clean
+        # single-direction tail; top-K truncation already bounds the per-token
+        # loss and JS is bounded in [0, log 2] regardless).
+        if self.zero_outside_topk and self.kl_type not in {"forward", "js"}:
+            assert H_all is not None, (
+                "SDPOLossFn requires H_all when zero_outside_topk=True; "
+                "the policy training forward must compute full-vocab entropy."
+            )
+            H_rest = H_all - (student_probs * student_topk_logprobs).sum(-1)
+            P_rest = 1.0 - student_probs.sum(-1)
+            tail = H_rest - self.log_infinitesimal * P_rest  # [B, S-1]
+            if self.kl_type == "mixed":
+                tail = tail * (1.0 - self.mixed_kl_weight)
+            per_token_kl = per_token_kl + tail
+
+        # Trust-region anchor to a frozen-init reference policy.
+        # We use prev_logprobs (snapshot at step start) as the student side; at
+        # LR=3e-7 the within-step drift is small. ref_kl is added regardless of
+        # sdpo_mask so that even samples without a teacher demonstration are
+        # still anchored to the init policy.
+        ref_kl_per_token: Optional[torch.Tensor] = None
+        if (
+            self.reference_policy_kl_penalty > 0.0
+            and "prev_logprobs" in data
+            and "reference_policy_logprobs" in data
+        ):
+            max_len = per_token_kl.shape[1]
+            student_lp = data["prev_logprobs"][:, 1:][:, :max_len]  # [B, S-1]
+            ref_lp = data["reference_policy_logprobs"][:, 1:][:, :max_len]
+            log_ratio = ref_lp - student_lp  # log(p_ref / p_student) at sampled tokens
+            if self.reference_policy_kl_type == "k1":
+                ref_kl_per_token = -log_ratio
+            elif self.reference_policy_kl_type == "k2":
+                ref_kl_per_token = 0.5 * log_ratio.pow(2)
+            else:  # "k3" — Schulman, unbiased, low-variance, always >= 0
+                ref_kl_per_token = torch.exp(log_ratio) - 1.0 - log_ratio
+            per_token_kl = (
+                per_token_kl + self.reference_policy_kl_penalty * ref_kl_per_token
+            )
+
+        # Effective mask: response token AND sample has demo AND sample is valid.
+        # token_mask is [B, S]; align to [B, S-1] and trim to per_token_kl length.
+        token_mask = data["token_mask"][:, 1:]
+        sdpo_mask = data["sdpo_mask"]
+        sample_mask = data["sample_mask"]
+        max_len = per_token_kl.shape[1]
+        token_mask = token_mask[:, :max_len]
+        effective_mask = (
+            token_mask * sdpo_mask.unsqueeze(-1).float() * sample_mask.unsqueeze(-1)
+        )
+
+        loss = masked_mean(
+            per_token_kl,
+            effective_mask,
+            global_normalization_factor=global_valid_toks,
+        )
+
+        metrics = {
+            "loss": loss.item() if loss.ndim == 0 else loss,
+            "num_valid_samples": sample_mask.sum().item(),
+            "sdpo/per_pos_kl": masked_mean(per_token_kl, effective_mask).item(),
+        }
+        if ref_kl_per_token is not None:
+            # Response-position mask without sdpo_mask: ref-KL applies to every
+            # sample regardless of whether a teacher demonstration is available.
+            ref_mask = token_mask * sample_mask.unsqueeze(-1)
+            metrics["sdpo/ref_kl"] = masked_mean(ref_kl_per_token, ref_mask).item()
+
+        return loss, metrics
+
+
+class SDPOHybridLossConfig(TypedDict):
+    """Configuration for the SDPO+GRPO hybrid loss.
+
+    The hybrid blends a clipped policy-gradient (GRPO) term with the SDPO
+    logit-level KL distillation term:
+
+        L(θ) = grpo_weight · L_GRPO(θ)  +  (1 − grpo_weight) · L_SDPO(θ)
+
+    Note on fidelity: the paper combines the two *advantages*
+    (A = λ·A_GRPO + (1−λ)·A_SDPO). Because this codebase realizes SDPO as a KL
+    distillation loss rather than an advantage, we blend at the *loss* level
+    instead. Mixing the losses mixes their gradients, which captures the same
+    bias/variance trade-off the paper describes, but is not bit-identical to
+    the advantage-space formula.
+
+    The two component configs are nested (rather than flattened) so the
+    `reference_policy_kl_penalty` key — which means different things for SDPO
+    (anchor to the frozen-init policy) and GRPO (KL penalty in the PG loss) —
+    does not collide.
+
+    Fields:
+        grpo_weight: λ ∈ [0, 1]. 0 ⇒ pure SDPO, 1 ⇒ pure GRPO clipped-PG.
+        sdpo: an SDPOLossConfig (see SDPOLossFn).
+        grpo: a ClippedPGLossConfig (see ClippedPGLossFn).
+    """
+
+    grpo_weight: float
+    sdpo: SDPOLossConfig
+    grpo: ClippedPGLossConfig
+
+
+class SDPOHybridLossFn(LossFunction):
+    """SDPO+GRPO hybrid loss, blended at the loss level.
+
+    Composes an inner SDPOLossFn and ClippedPGLossFn and returns
+
+        grpo_weight · L_GRPO + (1 − grpo_weight) · L_SDPO
+
+    Both component losses receive the raw student logits and compute their own
+    logprobs internally (SDPO via the shared distillation helper, GRPO via
+    ClippedPGLossFn's own gather), matching super-v3's loss-agnostic worker.
+
+    The SDPO term only affects samples that have a teacher demonstration
+    (sdpo_mask=1); the GRPO term affects every valid sample. This means even
+    demonstration-less samples still receive the policy-gradient signal.
+
+    References:
+        Hübotter et al. (2026) "Reinforcement Learning via Self-Distillation"
+        arXiv:2601.20802 §4.5
+    """
+
+    loss_type = LossType.TOKEN_LEVEL
+
+    def __init__(self, cfg: SDPOHybridLossConfig):
+        self.grpo_weight: float = float(cfg["grpo_weight"])
+        if not 0.0 <= self.grpo_weight <= 1.0:
+            raise ValueError(
+                f"SDPOHybridLossFn: grpo_weight must be in [0, 1], got {self.grpo_weight}"
+            )
+        self.sdpo_loss = SDPOLossFn(cfg["sdpo"])
+        self.grpo_loss = ClippedPGLossFn(cfg["grpo"])
+
+    def __call__(
+        self,
+        next_token_logits: torch.Tensor,
+        data: BatchedDataDict[Any],
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        vocab_parallel_rank: Optional[int] = None,
+        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        sdpo_loss, sdpo_metrics = self.sdpo_loss(
+            next_token_logits,
+            data,
+            global_valid_seqs,
+            global_valid_toks,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+        )
+        grpo_loss, grpo_metrics = self.grpo_loss(
+            next_token_logits,
+            data,
+            global_valid_seqs,
+            global_valid_toks,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+        )
+
+        loss = self.grpo_weight * grpo_loss + (1.0 - self.grpo_weight) * sdpo_loss
+
+        metrics: dict[str, Any] = {
+            "loss": loss.item(),
+            # Both component losses mask by sample_mask, so either count works.
+            "num_valid_samples": grpo_metrics["num_valid_samples"],
+            # loss-like values aggregate correctly under the worker's
+            # divide-by-num_global_batches-then-sum scheme (like "loss").
+            # grpo_weight is a constant and would be corrupted by it, so it is
+            # logged once per step in sdpo_train instead.
+            "hybrid/loss_grpo": grpo_loss.item(),
+            "hybrid/loss_sdpo": sdpo_loss.item(),
+        }
+        # Namespace the GRPO component metrics; keep SDPO's (already sdpo/*).
+        for k, v in grpo_metrics.items():
+            if k in ("loss", "num_valid_samples"):
+                continue
+            metrics[f"grpo/{k}"] = v
+        for k, v in sdpo_metrics.items():
+            if k in ("loss", "num_valid_samples"):
+                continue
+            metrics[k] = v
+
+        return loss, metrics
