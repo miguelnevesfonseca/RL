@@ -1295,7 +1295,7 @@ def sdpo_train(
                         weights_path=os.path.join(checkpoint_path, "policy", "weights"),
                         optimizer_path=(
                             os.path.join(checkpoint_path, "policy", "optimizer")
-                            if checkpointer.save_optimizer
+                            if master_config["checkpointing"].get("save_optimizer", True)
                             else None
                         ),
                         tokenizer_path=os.path.join(checkpoint_path, "policy", "tokenizer"),
