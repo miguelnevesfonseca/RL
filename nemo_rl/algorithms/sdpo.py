@@ -794,19 +794,38 @@ def setup(
     grpo_master_config["grpo"] = grpo_config_stub
     grpo_master_config["loss_fn"] = grpo_loss_fn_stub
 
-    (
-        policy,
-        policy_generation,
-        _nemo_gym_actor,  # discard: SDPO uses task_to_env, not NeMo-Gym
-        cluster,
-        dataloader,
-        val_dataloader,
-        _grpo_loss_fn,  # discard
-        logger,
-        checkpointer,
-        grpo_save_state,
-        _,
-    ) = grpo_setup(grpo_master_config, tokenizer, dataset, val_dataset)
+    # grpo_setup()'s return arity differs by nemo-rl lineage: the old super-v3 fork
+    # returns an extra nemo_gym_actor before cluster (11 values); official v0.6.0
+    # drops it (10 values, cluster in its place). Neither is used here, so just
+    # unpack whichever shape we got.
+    _grpo_setup_result = grpo_setup(grpo_master_config, tokenizer, dataset, val_dataset)
+    if len(_grpo_setup_result) == 11:
+        (
+            policy,
+            policy_generation,
+            _nemo_gym_actor,  # discard: SDPO uses task_to_env, not NeMo-Gym
+            cluster,
+            dataloader,
+            val_dataloader,
+            _grpo_loss_fn,  # discard
+            logger,
+            checkpointer,
+            grpo_save_state,
+            _,
+        ) = _grpo_setup_result
+    else:
+        (
+            policy,
+            policy_generation,
+            cluster,
+            dataloader,
+            val_dataloader,
+            _grpo_loss_fn,  # discard
+            logger,
+            checkpointer,
+            grpo_save_state,
+            _,
+        ) = _grpo_setup_result
 
     # Replace GRPO loss with SDPO loss (or the SDPO+GRPO hybrid when the
     # loss_fn config carries grpo_weight).
