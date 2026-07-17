@@ -28,7 +28,7 @@ in between.
 import pytest
 import torch
 
-from nemo_rl.algorithms.loss_functions import (
+from nemo_rl.algorithms.loss.loss_functions import (
     ClippedPGLossFn,
     SDPOHybridLossFn,
     SDPOLossFn,

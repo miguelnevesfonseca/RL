@@ -44,7 +44,7 @@ from nemo_rl.algorithms.grpo import (
     validate,
 )
 from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
-from nemo_rl.algorithms.loss_functions import (
+from nemo_rl.algorithms.loss.loss_functions import (
     SDPOHybridLossConfig,
     SDPOHybridLossFn,
     SDPOLossConfig,

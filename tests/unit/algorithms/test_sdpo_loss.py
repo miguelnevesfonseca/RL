@@ -24,7 +24,7 @@ import math
 import pytest
 import torch
 
-from nemo_rl.algorithms.loss_functions import SDPOLossFn
+from nemo_rl.algorithms.loss.loss_functions import SDPOLossFn
 
 
 def setup_sdpo_test_data(
