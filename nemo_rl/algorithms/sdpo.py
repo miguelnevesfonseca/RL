@@ -50,7 +50,7 @@ from nemo_rl.algorithms.loss.loss_functions import (
     SDPOLossConfig,
     SDPOLossFn,
 )
-from nemo_rl.algorithms.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import DatumSpec
