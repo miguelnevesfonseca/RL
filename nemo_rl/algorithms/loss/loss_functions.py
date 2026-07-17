@@ -19,7 +19,10 @@ import torch
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossInputType, LossType
 from nemo_rl.algorithms.utils import calculate_kl, masked_mean
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.model_utils import DistributedCrossEntropy
+from nemo_rl.distributed.model_utils import (
+    DistributedCrossEntropy,
+    get_next_token_logprobs_from_logits,
+)
 
 Tensor = TypeVar("Tensor", bound=torch.Tensor)
 
@@ -1283,6 +1286,16 @@ class SDPOLossFn(LossFunction):
     """
 
     loss_type = LossType.TOKEN_LEVEL
+    # v0.6.0's prepare_loss_input/LossInputType dispatch computes
+    # student/teacher top-k logprobs (+H_all) BEFORE calling the loss
+    # function -- this class was ported from an older fork convention where
+    # the loss function received raw logits and derived these itself
+    # (docstrings below still describe that, now stale). DistillationLossFn
+    # was already migrated to this same DISTILLATION input_type; this class
+    # gets the identical treatment so prepare_loss_input's DISTILLATION
+    # branch (which reads data["teacher_topk_logits"]/["teacher_topk_indices"],
+    # the same keys this class's own internal computation used) can serve it.
+    input_type = LossInputType.DISTILLATION
 
     def __init__(self, cfg: SDPOLossConfig):
         self.kl_type: str = cfg.get("kl_type", "reverse")
@@ -1313,31 +1326,20 @@ class SDPOLossFn(LossFunction):
 
     def __call__(
         self,
-        next_token_logits: torch.Tensor,
+        student_topk_logprobs: torch.Tensor,
+        teacher_topk_logprobs: torch.Tensor,
+        H_all: torch.Tensor | None,
         data: BatchedDataDict[SDPOLossDataDict],
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
-        vocab_parallel_rank: Optional[int] = None,
-        vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-        context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Compute the SDPO logit-level KL loss from raw student logits."""
-        # Derive next-token-aligned top-k logprobs (and H_all for the tail
-        # correction) from the raw logits, sharing DistillationLossFn's
-        # vocab-parallel / CP / DTensor gather logic.
-        student_topk_logprobs, teacher_topk_logprobs, H_all = (
-            _compute_distillation_topk_logprobs(
-                next_token_logits,
-                data["teacher_topk_logits"],
-                data["teacher_topk_indices"],
-                zero_outside_topk=self.zero_outside_topk,
-                compute_entropy=self.kl_type not in {"forward", "js"},
-                vocab_parallel_rank=vocab_parallel_rank,
-                vocab_parallel_group=vocab_parallel_group,
-                context_parallel_group=context_parallel_group,
-            )
-        )
+        """Compute the SDPO logit-level KL loss.
 
+        student_topk_logprobs/teacher_topk_logprobs/H_all are computed by
+        prepare_loss_input's LossInputType.DISTILLATION branch (this class's
+        input_type) from the raw logits + data["teacher_topk_logits"]/
+        ["teacher_topk_indices"] -- this class no longer derives them itself.
+        """
         student_probs = student_topk_logprobs.exp()  # [B, S-1, K]
         teacher_probs = teacher_topk_logprobs.exp()  # [B, S-1, K]
 
@@ -1495,6 +1497,12 @@ class SDPOHybridLossFn(LossFunction):
     """
 
     loss_type = LossType.TOKEN_LEVEL
+    # Unlike SDPOLossFn/ClippedPGLossFn individually, this class genuinely needs
+    # TWO different views of the same logits at once (DISTILLATION-shaped for the
+    # SDPO term, LOGPROB-shaped for the GRPO term) -- no single LossInputType
+    # variant covers that, so this stays LOGIT and does both conversions itself,
+    # the same way prepare_loss_input would for each half individually.
+    input_type = LossInputType.LOGIT
 
     def __init__(self, cfg: SDPOHybridLossConfig):
         self.grpo_weight: float = float(cfg["grpo_weight"])
@@ -1507,7 +1515,7 @@ class SDPOHybridLossFn(LossFunction):
 
     def __call__(
         self,
-        next_token_logits: torch.Tensor,
+        logits: torch.Tensor,
         data: BatchedDataDict[Any],
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
@@ -1515,23 +1523,40 @@ class SDPOHybridLossFn(LossFunction):
         vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
         context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        student_topk_logprobs, teacher_topk_logprobs, H_all = (
+            _compute_distillation_topk_logprobs(
+                logits,
+                data["teacher_topk_logits"],
+                data["teacher_topk_indices"],
+                zero_outside_topk=self.sdpo_loss.zero_outside_topk,
+                compute_entropy=self.sdpo_loss.kl_type not in {"forward", "js"},
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+            )
+        )
         sdpo_loss, sdpo_metrics = self.sdpo_loss(
-            next_token_logits,
+            student_topk_logprobs,
+            teacher_topk_logprobs,
+            H_all,
             data,
             global_valid_seqs,
             global_valid_toks,
+        )
+
+        next_token_logprobs = get_next_token_logprobs_from_logits(
+            input_ids=data["input_ids"],
+            next_token_logits=logits,
+            seq_index=data.get("seq_index", None),
             vocab_parallel_rank=vocab_parallel_rank,
             vocab_parallel_group=vocab_parallel_group,
             context_parallel_group=context_parallel_group,
         )
         grpo_loss, grpo_metrics = self.grpo_loss(
-            next_token_logits,
+            next_token_logprobs,
             data,
             global_valid_seqs,
             global_valid_toks,
-            vocab_parallel_rank=vocab_parallel_rank,
-            vocab_parallel_group=vocab_parallel_group,
-            context_parallel_group=context_parallel_group,
         )
 
         loss = self.grpo_weight * grpo_loss + (1.0 - self.grpo_weight) * sdpo_loss
