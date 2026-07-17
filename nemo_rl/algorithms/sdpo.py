@@ -1207,11 +1207,42 @@ def sdpo_train(
                 metrics["train/mean_reward"] = rewards.mean().item()
                 metrics["train/success_fraction"] = (rewards >= success_threshold).float().mean().item()
 
-                # Aggregate SDPO-specific (and, for the hybrid, GRPO/hybrid)
-                # metrics from the loss function.
+                # Aggregate ALL per-microbatch metrics from the loss function / policy
+                # worker. Previously this only kept keys containing "sdpo"/"hybrid" or
+                # prefixed "grpo/" -- but ClippedPGLossFn (and the policy worker's own
+                # per-step stats) return bare, unprefixed keys (gen_kl_error, probs_ratio,
+                # kl_penalty, policy_kl_error, js_divergence_error, approx_entropy, lr, wd,
+                # etc.), so `k.startswith("grpo/")` never matched anything real and every
+                # GRPO-style diagnostic was silently dropped before it ever reached the
+                # logger. sdpo/hybrid-namespaced keys keep their own top-level namespace
+                # (unchanged); everything else gets the same "train/" prefix convention
+                # sdpo.py already uses for loss/grad_norm/etc above, mirroring how
+                # grpo_train's `logger.log_metrics(metrics, ..., prefix="train")` nests
+                # its own raw loss-function metrics under train/.
+                _MIN_KEYS = {"probs_ratio_min", "probs_ratio_clamped_min"}
+                _MAX_KEYS = {"probs_ratio_max", "probs_ratio_clamped_max"}
+                _PASSTHROUGH_KEYS = {
+                    "lr", "wd", "global_valid_seqs", "global_valid_toks",
+                    "mean_prompt_length",
+                }
                 for k, v in train_results.get("all_mb_metrics", {}).items():
-                    if "sdpo" in k or "hybrid" in k or k.startswith("grpo/"):
+                    if "sdpo" in k or "hybrid" in k:
                         metrics[k] = sum(v) / len(v) if isinstance(v, list) else v
+                        continue
+                    if isinstance(v, list) and v:
+                        if k in _MIN_KEYS:
+                            finite = [x for x in v if x not in (float("inf"), float("-inf"))]
+                            reduced = min(finite) if finite else -1.0
+                        elif k in _MAX_KEYS:
+                            finite = [x for x in v if x not in (float("inf"), float("-inf"))]
+                            reduced = max(finite) if finite else -1.0
+                        elif k in _PASSTHROUGH_KEYS:
+                            reduced = v[0]
+                        else:
+                            reduced = sum(v) / len(v)
+                    else:
+                        reduced = v
+                    metrics[f"train/{k}"] = reduced
 
                 num_valid_tokens = int(
                     (train_data["token_mask"] * train_data["sample_mask"].unsqueeze(-1)).sum().item()
@@ -1259,7 +1290,25 @@ def sdpo_train(
                         )
 
                 # Log
+                # Previously sdpo_train() never extracted or logged the `timer.time(...)`
+                # blocks it already collects throughout this loop (data_processing,
+                # generation, teacher_input_construction, policy_training, etc.) -- the
+                # data was gathered but discarded, unlike grpo_train's matching
+                # `timer.get_timing_metrics(reduction_op="sum")` + `timer.reset()` pattern.
+                # NOTE: no `prefix="train"` here -- unlike grpo_train, this dict's keys
+                # already carry their intended namespace as literal string prefixes
+                # ("train/...", "sdpo/...", "hybrid/..."), so passing a logger-level
+                # prefix would double it up (e.g. "train/train/loss") and rename the
+                # already-live "sdpo/*" metrics out from under existing dashboards.
+                timing_metrics = timer.get_timing_metrics(reduction_op="sum")
                 logger.log_metrics(metrics, step=total_steps + 1)
+                logger.log_metrics(
+                    timing_metrics,
+                    total_steps + 1,
+                    prefix="timing/train",
+                    step_finished=True,
+                )
+                timer.reset()
 
                 # ── Checkpoint ───────────────────────────────────────────────
                 current_step += 1
