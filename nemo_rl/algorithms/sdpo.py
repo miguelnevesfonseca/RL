@@ -979,6 +979,15 @@ def sdpo_train(
             maybe_gpu_profile_step(policy, total_steps + 1)
             val_metrics = None
 
+            # Reset at loop-TOP (not after logging below) -- the with-block on the next
+            # line spans the whole rest of this iteration's body (no dedent point before
+            # EOF), so a reset() call anywhere inside it would wipe "total_step_time"'s own
+            # _start_times entry before its own `finally: self.stop(...)` runs, raising
+            # "Timer 'total_step_time' is not running." This achieves the same per-step
+            # (not cumulative-since-run-start) semantics grpo_train gets from resetting
+            # right after its with-block closes, without ever resetting while it's open.
+            timer.reset()
+
             with timer.time("total_step_time"):
                 # ── Prepare batch ────────────────────────────────────────────
                 print("Preparing batch...", flush=True)
@@ -1319,6 +1328,10 @@ def sdpo_train(
                 # ("train/...", "sdpo/...", "hybrid/..."), so passing a logger-level
                 # prefix would double it up (e.g. "train/train/loss") and rename the
                 # already-live "sdpo/*" metrics out from under existing dashboards.
+                # NOTE: read (not reset) here -- "total_step_time" is still running until
+                # this whole with-block exits, and reduction_op="sum" over one iteration's
+                # samples-per-label is equivalent to a per-step value. The actual reset
+                # happens at the top of the NEXT iteration (see comment there).
                 timing_metrics = timer.get_timing_metrics(reduction_op="sum")
                 logger.log_metrics(metrics, step=total_steps + 1)
                 logger.log_metrics(
@@ -1327,7 +1340,6 @@ def sdpo_train(
                     prefix="timing/train",
                     step_finished=True,
                 )
-                timer.reset()
 
                 # ── Checkpoint ───────────────────────────────────────────────
                 current_step += 1
